@@ -24,6 +24,11 @@ def objective(trial):
     # 1. Hyperparameters to tune
     k_neighbors = trial.suggest_int('k_neighbors', 3, 10)
     
+    # Tuning learning rate and Focal Loss parameters
+    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    alpha = trial.suggest_float('alpha', 0.1, 0.9)
+    gamma = trial.suggest_float('gamma', 0.5, 5.0)
+    
     # We can tune sampling strategy (ratio of minority/majority)
     # Since we have multi-class, 'auto' simply resamples all except majority to equal majority
     # If we want to tune specific ratios, it's more complex with multi-class SMOTE.
@@ -89,8 +94,8 @@ def objective(trial):
         n_classes=len(label_encoder.classes_)
     ).to(device)
     
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    criterion = FocalLoss(alpha=alpha, gamma=gamma)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
     
     # 8. Train for fewer epochs for tuning speed
