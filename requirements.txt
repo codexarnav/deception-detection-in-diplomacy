@@ -1,0 +1,10 @@
+pandas
+numpy
+torch
+torch_geometric
+sentence-transformers
+scikit-learn
+matplotlib
+tqdm
+faiss-cpu
+imbalanced-learn
