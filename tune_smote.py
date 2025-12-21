@@ -101,11 +101,15 @@ def objective(trial):
     # 8. Train for fewer epochs for tuning speed
     n_tuning_epochs = 5 
     
+    # Use a unique save directory for each trial to avoid file locking issues on Windows
+    # and to keep artifacts separate.
+    trial_save_dir = f"./optuna_checkpoints/trial_{trial.number}"
+    
     # We need a modified train loop that returns val_f1 directly or use the existing one
     # The existing train_model returns a history dict
     history = train_model(
         train_loader, val_loader, model, criterion, optimizer, scheduler,
-        device, n_epochs=n_tuning_epochs, save_dir="./optuna_checkpoints"
+        device, n_epochs=n_tuning_epochs, save_dir=trial_save_dir
     )
     
     return history['best_val_f1']
