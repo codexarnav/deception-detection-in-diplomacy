@@ -282,6 +282,37 @@ def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler
     }
 
 
+def plot_training_history(history, save_dir):
+    """Plot training metrics and save to file"""
+    epochs = range(1, len(history['train_losses']) + 1)
+    
+    plt.figure(figsize=(12, 5))
+    
+    # Plot Losses
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history['train_losses'], 'b-', label='Training Loss')
+    plt.plot(epochs, history['val_losses'], 'r-', label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot F1 Score
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history['val_f1_scores'], 'g-', label='Validation F1')
+    plt.title('Validation F1 Score')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_history.png'))
+    plt.close()
+    print(f"Training history plot saved to {save_dir}/training_history.png")
+
+
 # ------------------------------
 #   EVALUATION
 # ------------------------------
@@ -346,7 +377,7 @@ def main():
     fused = np.concatenate([text_emb, strat_emb], axis=1)
 
     print("Applying SMOTE...")
-    sm = SMOTE(k_neighbors=5, random_state=42)
+    sm = SMOTE(k_neighbors=7, random_state=42)
     fused_resampled, labels_resampled = sm.fit_resample(fused, labels)
 
     # Un-fuse
@@ -400,6 +431,9 @@ def main():
         criterion, optimizer, scheduler,
         config['device'], config['n_epochs'], config['save_dir']
     )
+
+    # Plot metrics
+    plot_training_history(history, config['save_dir'])
 
     # ---- Evaluate ----
     print("Loading best model...")

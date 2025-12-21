@@ -38,6 +38,5 @@ ENV/
 
 # Project specifics
 data/
-deception_model_*/
 test_allminilm_finetuned-*/
 strategic_embeddings.index
