@@ -352,7 +352,7 @@ def main():
         'text_dim': 256,
         'fusion_dim': 512,
         'batch_size': 32,
-        'learning_rate': 1e-4,
+        'learning_rate': 2.76e-4,
         'n_epochs': 25,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
@@ -377,7 +377,7 @@ def main():
     fused = np.concatenate([text_emb, strat_emb], axis=1)
 
     print("Applying SMOTE...")
-    sm = SMOTE(k_neighbors=7, random_state=42)
+    sm = SMOTE(k_neighbors=9, random_state=42)
     fused_resampled, labels_resampled = sm.fit_resample(fused, labels)
 
     # Un-fuse
@@ -421,7 +421,7 @@ def main():
         n_classes=len(label_encoder.classes_)
     ).to(config['device'])
 
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    criterion = FocalLoss(alpha=0.7853340281754244, gamma=2.746751415946808)
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 

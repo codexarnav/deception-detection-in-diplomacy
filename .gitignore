@@ -40,3 +40,5 @@ ENV/
 data/
 test_allminilm_finetuned-*/
 strategic_embeddings.index
+optuna_checkpoints/
+optuna_checkpoints/
