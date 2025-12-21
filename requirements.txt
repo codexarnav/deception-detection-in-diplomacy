@@ -8,3 +8,4 @@ matplotlib
 tqdm
 faiss-cpu
 imbalanced-learn
+optuna
