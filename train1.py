@@ -281,11 +281,6 @@ def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler
         'best_val_f1': best_val_f1
     }
 
-
-# ------------------------------
-#   EVALUATION
-# ------------------------------
-
 def evaluate_model(test_loader, model, device, label_encoder):
     model.eval()
     preds, trues = [], []
@@ -321,7 +316,7 @@ def main():
         'text_dim': 256,
         'fusion_dim': 512,
         'batch_size': 32,
-        'learning_rate': 1e-4,
+        'learning_rate': 2.76e-4,
         'n_epochs': 25,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
@@ -337,25 +332,9 @@ def main():
 
     # ---- Labels ----
     labels, label_encoder = prepare_labels(df)
-
-    # -------------------------
-    #  OPTION A — FUSED SMOTE
-    # -------------------------
-
-    print("Fusing embeddings...")
-    fused = np.concatenate([text_emb, strat_emb], axis=1)
-
-    print("Applying SMOTE...")
-    sm = SMOTE(k_neighbors=5, random_state=42)
-    fused_resampled, labels_resampled = sm.fit_resample(fused, labels)
-
-    # Un-fuse
-    text_dim = text_emb.shape[1]
-    X_text = fused_resampled[:, :text_dim]
-    X_strat = fused_resampled[:, text_dim:]
-    y = labels_resampled
-
-    # ---- Train / Val / Test Split ----
+    n_classes = len(label_encoder.classes_)
+    
+    # 4. Split data
     X_text_train, X_text_temp, X_strat_train, X_strat_temp, y_train, y_temp = train_test_split(
         X_text, X_strat, y, test_size=0.3, random_state=42, stratify=y
     )
@@ -389,7 +368,7 @@ def main():
         fusion_dim=config['fusion_dim'],
         n_classes=len(label_encoder.classes_)
     ).to(config['device'])
-
+    
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
@@ -400,10 +379,10 @@ def main():
         criterion, optimizer, scheduler,
         config['device'], config['n_epochs'], config['save_dir']
     )
-
-    # ---- Evaluate ----
-    print("Loading best model...")
-    checkpoint = torch.load(os.path.join(config['save_dir'], "best_model.pth"))
+    
+    # 9. Load best model and evaluate
+    print("Loading best model for evaluation...")
+    checkpoint = torch.load(os.path.join(config['save_dir'], 'best_model.pth'))
     model.load_state_dict(checkpoint['model_state_dict'])
 
     evaluate_model(test_loader, model, config['device'], label_encoder)
