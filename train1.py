@@ -96,7 +96,7 @@ class FocalLoss(nn.Module):
 # ------------------------------
 
 class MultiClassDeceptionDetector(nn.Module):
-    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512, n_classes=4, n_monte_carlo=10):
+    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512, n_classes=4, n_monte_carlo=10, dropout1=0.4, dropout2=0.3):
         super(MultiClassDeceptionDetector, self).__init__()
         
         from test import EmbeddingFusion, UncertaintyQuantification
@@ -108,10 +108,10 @@ class MultiClassDeceptionDetector(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(dropout1),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout2),
             nn.Linear(128, n_classes)
         )
         
@@ -352,7 +352,7 @@ def main():
         'text_dim': 256,
         'fusion_dim': 512,
         'batch_size': 32,
-        'learning_rate': 2.76e-4,
+        'learning_rate': 3.532033526528867e-4,
         'n_epochs': 25,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
@@ -377,7 +377,7 @@ def main():
     fused = np.concatenate([text_emb, strat_emb], axis=1)
 
     print("Applying SMOTE...")
-    sm = SMOTE(k_neighbors=9, random_state=42)
+    sm = SMOTE(k_neighbors=4, random_state=42)
     fused_resampled, labels_resampled = sm.fit_resample(fused, labels)
 
     # Un-fuse
@@ -418,11 +418,13 @@ def main():
         strategic_dim=config['strategic_dim'],
         text_dim=config['text_dim'],
         fusion_dim=config['fusion_dim'],
-        n_classes=len(label_encoder.classes_)
+        n_classes=len(label_encoder.classes_),
+        dropout1=0.22798466779344834,
+        dropout2=0.293627659799008
     ).to(config['device'])
 
-    criterion = FocalLoss(alpha=0.7853340281754244, gamma=2.746751415946808)
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+    criterion = FocalLoss(alpha=0.32910692087020266, gamma=2.040172718188119)
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1.1615339145351501e-05)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
     # ---- Train ----

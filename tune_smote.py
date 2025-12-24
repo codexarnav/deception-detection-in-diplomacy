@@ -29,6 +29,11 @@ def objective(trial):
     alpha = trial.suggest_float('alpha', 0.1, 0.9)
     gamma = trial.suggest_float('gamma', 0.5, 5.0)
     
+    # Tuning Dropout and Weight Decay
+    dropout1 = trial.suggest_float('dropout1', 0.2, 0.6)
+    dropout2 = trial.suggest_float('dropout2', 0.2, 0.6)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+    
     # We can tune sampling strategy (ratio of minority/majority)
     # Since we have multi-class, 'auto' simply resamples all except majority to equal majority
     # If we want to tune specific ratios, it's more complex with multi-class SMOTE.
@@ -91,11 +96,13 @@ def objective(trial):
         strategic_dim=config['strategic_dim'],
         text_dim=config['text_dim'],
         fusion_dim=config['fusion_dim'],
-        n_classes=len(label_encoder.classes_)
+        n_classes=len(label_encoder.classes_),
+        dropout1=dropout1,
+        dropout2=dropout2
     ).to(device)
     
     criterion = FocalLoss(alpha=alpha, gamma=gamma)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
     
     # 8. Train for fewer epochs for tuning speed
@@ -137,7 +144,7 @@ if __name__ == "__main__":
     
     print("Starting Optuna Study...")
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=10)
+    study.optimize(objective, n_trials=30)
     
     print("Number of finished trials: ", len(study.trials))
     print("Best trial:")
