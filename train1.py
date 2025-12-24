@@ -1,5 +1,7 @@
 """
-SIMPLER BASELINE - Try this if the complex model keeps overfitting
+Deception Detection with Cross-Attention Fusion
+Implements attention-based fusion between text and strategic embeddings
+to improve deception detection in Diplomacy game conversations.
 """
 
 import torch
@@ -60,8 +62,123 @@ class DeceptionDataset(Dataset):
         }
 
 
+class CrossAttentionFusion(nn.Module):
+    """Cross-attention mechanism for fusing text and strategic embeddings"""
+    def __init__(self, dim, num_heads=4, dropout=0.1):
+        super(CrossAttentionFusion, self).__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+        
+        # Query, Key, Value projections for cross-attention
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(dim)
+        
+    def forward(self, query, key_value):
+        """
+        Args:
+            query: (batch_size, dim) - queries from one modality
+            key_value: (batch_size, dim) - keys and values from another modality
+        Returns:
+            (batch_size, dim) - attended features
+        """
+        batch_size = query.size(0)
+        
+        # Add sequence dimension for attention (batch, 1, dim)
+        query = query.unsqueeze(1)
+        key_value = key_value.unsqueeze(1)
+        
+        # Project to Q, K, V
+        Q = self.q_proj(query)  # (batch, 1, dim)
+        K = self.k_proj(key_value)  # (batch, 1, dim)
+        V = self.v_proj(key_value)  # (batch, 1, dim)
+        
+        # Reshape for multi-head attention: (batch, num_heads, 1, head_dim)
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, V)  # (batch, num_heads, 1, head_dim)
+        
+        # Reshape back: (batch, 1, dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, self.dim)
+        
+        # Output projection and residual connection
+        output = self.out_proj(attn_output)
+        output = output.squeeze(1)  # (batch, dim)
+        
+        # Residual connection and layer norm
+        output = self.layer_norm(query.squeeze(1) + self.dropout(output))
+        
+        return output
+
+
+class CrossAttentionDeceptionClassifier(nn.Module):
+    """Attention-based fusion of text and strategic embeddings"""
+    def __init__(self, strategic_dim=256, text_dim=256, n_classes=2, num_heads=4, dropout=0.3):
+        super(CrossAttentionDeceptionClassifier, self).__init__()
+        
+        # Ensure both embeddings have the same dimension for attention
+        self.strategic_proj = nn.Linear(strategic_dim, 256)
+        self.text_proj = nn.Linear(text_dim, 256)
+        
+        # Cross-attention layers
+        # Text attends to strategic information
+        self.text_to_strategic_attn = CrossAttentionFusion(256, num_heads=num_heads, dropout=dropout)
+        # Strategic attends to text information
+        self.strategic_to_text_attn = CrossAttentionFusion(256, num_heads=num_heads, dropout=dropout)
+        
+        # Fusion layer to combine attended features
+        self.fusion = nn.Sequential(
+            nn.Linear(256 * 2, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, n_classes)
+        )
+    
+    def forward(self, strategic_emb, text_emb):
+        # Project to common dimension
+        strategic_features = self.strategic_proj(strategic_emb)
+        text_features = self.text_proj(text_emb)
+        
+        # Cross-attention: each modality attends to the other
+        text_attended = self.text_to_strategic_attn(text_features, strategic_features)
+        strategic_attended = self.strategic_to_text_attn(strategic_features, text_features)
+        
+        # Combine attended features
+        combined = torch.cat([text_attended, strategic_attended], dim=-1)
+        fused = self.fusion(combined)
+        
+        # Classification
+        logits = self.classifier(fused)
+        
+        return logits
+
+
 class SimpleDeceptionClassifier(nn.Module):
-    """Much simpler architecture to reduce overfitting"""
+    """Much simpler architecture to reduce overfitting (Legacy - kept for compatibility)"""
     def __init__(self, strategic_dim=256, text_dim=256, n_classes=2, dropout=0.3):
         super(SimpleDeceptionClassifier, self).__init__()
         
@@ -262,6 +379,8 @@ def plot_history(history, save_dir):
 
 
 def main():
+    use_attention = True  # Set to True for CrossAttention, False for Simple model
+    
     config = {
         'csv_path': 'data/final_dataset1.csv',
         'model_path': 'test_allminilm_finetuned-20250829T234732Z-1-001/test_allminilm_finetuned',
@@ -271,14 +390,17 @@ def main():
         'learning_rate': 1e-4,
         'weight_decay': 1e-3,  # Strong regularization
         'dropout': 0.4,
-        'n_epochs': 100,
+        'num_heads': 4,  # Number of attention heads for cross-attention
+        'use_attention': use_attention,
+        'n_epochs': 60,
         'patience': 20,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        'save_dir': f'./simple_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        'save_dir': f'./{"attention" if use_attention else "simple"}_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     }
     
     print("="*70)
-    print("SIMPLE BASELINE MODEL")
+    print("DECEPTION DETECTION MODEL")
+    print("Cross-Attention Fusion" if config['use_attention'] else "Simple Concatenation")
     print("="*70)
     for k, v in config.items():
         print(f"  {k}: {v}")
@@ -344,13 +466,24 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
 
-    # Simple model
-    model = SimpleDeceptionClassifier(
-        strategic_dim=config['strategic_dim'],
-        text_dim=config['text_dim'],
-        n_classes=len(label_encoder.classes_),
-        dropout=config['dropout']
-    ).to(config['device'])
+    # Create model based on configuration
+    if config['use_attention']:
+        model = CrossAttentionDeceptionClassifier(
+            strategic_dim=config['strategic_dim'],
+            text_dim=config['text_dim'],
+            n_classes=len(label_encoder.classes_),
+            num_heads=config['num_heads'],
+            dropout=config['dropout']
+        ).to(config['device'])
+        print(f"✓ Using CrossAttentionDeceptionClassifier with {config['num_heads']} attention heads")
+    else:
+        model = SimpleDeceptionClassifier(
+            strategic_dim=config['strategic_dim'],
+            text_dim=config['text_dim'],
+            n_classes=len(label_encoder.classes_),
+            dropout=config['dropout']
+        ).to(config['device'])
+        print("✓ Using SimpleDeceptionClassifier (concatenation-based)")
 
     print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters\n")
 
