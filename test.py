@@ -24,17 +24,25 @@ def generalEmbeddings(Message):
     return embedding
 
 class EmbeddingFusion(nn.Module):
-    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512):
+    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512, num_heads=16, attention_dropout=0.1):
         super(EmbeddingFusion, self).__init__()
         
         # Projection layers to match dimensions
         self.strategic_proj = nn.Linear(strategic_dim, fusion_dim)
         self.text_proj = nn.Linear(text_dim, fusion_dim)
         
-        # Cross-attention for fusion
-        self.cross_attention = MultiheadAttention(fusion_dim, num_heads=8, batch_first=True)
+        # Enhanced Cross-attention with more heads and dropout
+        self.cross_attention = MultiheadAttention(
+            fusion_dim, 
+            num_heads=num_heads,  # Increased from 8 to 16
+            dropout=attention_dropout,  # Prevent attention overfitting
+            batch_first=True
+        )
         
-        # Fusion layer
+        # Residual projection for skip connection
+        self.residual_proj = nn.Linear(fusion_dim, fusion_dim)
+        
+        # Enhanced fusion layer with residual
         self.fusion_layer = nn.Sequential(
             nn.Linear(fusion_dim * 2, fusion_dim),
             nn.ReLU(),
@@ -48,11 +56,17 @@ class EmbeddingFusion(nn.Module):
         text_proj = self.text_proj(text_emb).unsqueeze(1)  # [B, 1, D]
         
         # Cross-attention between strategic and textual
-        attn_out, _ = self.cross_attention(strategic_proj, text_proj, text_proj)
+        attn_out, attn_weights = self.cross_attention(strategic_proj, text_proj, text_proj)
         
         # Concatenate and fuse
         fused = torch.cat([strategic_proj.squeeze(1), attn_out.squeeze(1)], dim=-1)
-        return self.fusion_layer(fused)
+        fused_out = self.fusion_layer(fused)
+        
+        # Residual connection from strategic projection
+        residual = self.residual_proj(strategic_proj.squeeze(1))
+        final_out = fused_out + residual  # Skip connection
+        
+        return final_out
 class FocalLoss(nn.Module):
     def __init__(self,alpha,gamma,reduction='mean'):
         super(FocalLoss, self).__init__()

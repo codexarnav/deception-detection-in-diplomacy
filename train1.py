@@ -1,49 +1,31 @@
-"""
-Deception Detection with Cross-Attention Fusion
-Implements attention-based fusion between text and strategic embeddings
-to improve deception detection in Diplomacy game conversations.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import pickle
 import os
+import json
 from datetime import datetime
+from imblearn.combine import SMOTETomek
+from imblearn.over_sampling import SMOTE  # Needed for SMOTETomek parameter
 
+# Import your existing modules
 from sentence_transformers import SentenceTransformer
 from gnn import get_strategic_embeddings
-from imblearn.combine import SMOTETomek
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-
+# ------------------------------
+#  DATASET + SAMPLER
+# ------------------------------
 
 class DeceptionDataset(Dataset):
     def __init__(self, text_embeddings, strategic_embeddings, labels):
@@ -56,155 +38,15 @@ class DeceptionDataset(Dataset):
     
     def __getitem__(self, idx):
         return {
-            'text_embedding': torch.FloatTensor(self.text_embeddings[idx]),
-            'strategic_embedding': torch.FloatTensor(self.strategic_embeddings[idx]),
-            'label': torch.tensor(self.labels[idx], dtype=torch.long)
-        }
+        'text_embedding': torch.FloatTensor(self.text_embeddings[idx]),
+        'strategic_embedding': torch.FloatTensor(self.strategic_embeddings[idx]),
+        'label': torch.tensor(self.labels[idx], dtype=torch.long)
+    }
 
 
-class CrossAttentionFusion(nn.Module):
-    """Cross-attention mechanism for fusing text and strategic embeddings"""
-    def __init__(self, dim, num_heads=4, dropout=0.1):
-        super(CrossAttentionFusion, self).__init__()
-        self.num_heads = num_heads
-        self.dim = dim
-        self.head_dim = dim // num_heads
-        
-        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        
-        # Query, Key, Value projections for cross-attention
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(dim)
-        
-    def forward(self, query, key_value):
-        """
-        Args:
-            query: (batch_size, dim) - queries from one modality
-            key_value: (batch_size, dim) - keys and values from another modality
-        Returns:
-            (batch_size, dim) - attended features
-        """
-        batch_size = query.size(0)
-        
-        # Add sequence dimension for attention (batch, 1, dim)
-        query = query.unsqueeze(1)
-        key_value = key_value.unsqueeze(1)
-        
-        # Project to Q, K, V
-        Q = self.q_proj(query)  # (batch, 1, dim)
-        K = self.k_proj(key_value)  # (batch, 1, dim)
-        V = self.v_proj(key_value)  # (batch, 1, dim)
-        
-        # Reshape for multi-head attention: (batch, num_heads, 1, head_dim)
-        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, V)  # (batch, num_heads, 1, head_dim)
-        
-        # Reshape back: (batch, 1, dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, self.dim)
-        
-        # Output projection and residual connection
-        output = self.out_proj(attn_output)
-        output = output.squeeze(1)  # (batch, dim)
-        
-        # Residual connection and layer norm
-        output = self.layer_norm(query.squeeze(1) + self.dropout(output))
-        
-        return output
-
-
-class CrossAttentionDeceptionClassifier(nn.Module):
-    """Attention-based fusion of text and strategic embeddings"""
-    def __init__(self, strategic_dim=256, text_dim=256, n_classes=2, num_heads=4, dropout=0.3):
-        super(CrossAttentionDeceptionClassifier, self).__init__()
-        
-        # Ensure both embeddings have the same dimension for attention
-        self.strategic_proj = nn.Linear(strategic_dim, 256)
-        self.text_proj = nn.Linear(text_dim, 256)
-        
-        # Cross-attention layers
-        # Text attends to strategic information
-        self.text_to_strategic_attn = CrossAttentionFusion(256, num_heads=num_heads, dropout=dropout)
-        # Strategic attends to text information
-        self.strategic_to_text_attn = CrossAttentionFusion(256, num_heads=num_heads, dropout=dropout)
-        
-        # Fusion layer to combine attended features
-        self.fusion = nn.Sequential(
-            nn.Linear(256 * 2, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, n_classes)
-        )
-    
-    def forward(self, strategic_emb, text_emb):
-        # Project to common dimension
-        strategic_features = self.strategic_proj(strategic_emb)
-        text_features = self.text_proj(text_emb)
-        
-        # Cross-attention: each modality attends to the other
-        text_attended = self.text_to_strategic_attn(text_features, strategic_features)
-        strategic_attended = self.strategic_to_text_attn(strategic_features, text_features)
-        
-        # Combine attended features
-        combined = torch.cat([text_attended, strategic_attended], dim=-1)
-        fused = self.fusion(combined)
-        
-        # Classification
-        logits = self.classifier(fused)
-        
-        return logits
-
-
-class SimpleDeceptionClassifier(nn.Module):
-    """Much simpler architecture to reduce overfitting (Legacy - kept for compatibility)"""
-    def __init__(self, strategic_dim=256, text_dim=256, n_classes=2, dropout=0.3):
-        super(SimpleDeceptionClassifier, self).__init__()
-        
-        # Simple concatenation fusion
-        input_dim = strategic_dim + text_dim
-        
-        # Smaller, simpler network
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(256, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(64, n_classes)
-        )
-    
-    def forward(self, strategic_emb, text_emb):
-        # Simple concatenation
-        x = torch.cat([strategic_emb, text_emb], dim=-1)
-        return self.network(x)
-
+# ------------------------------
+#   LABEL PROCESSING HELPERS
+# ------------------------------
 
 def parse_bool_label(v):
     if pd.isna(v):
@@ -230,14 +72,204 @@ def deception_state_from_bools(sender_b, receiver_b):
         return 'successful_deception'
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha, gamma, label_smoothing=0.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        if isinstance(inputs, dict):
+            logits = inputs['logits']
+        else:
+            logits = inputs
+
+        # Apply label smoothing
+        if self.label_smoothing > 0:
+            n_classes = logits.size(-1)
+            # Smooth labels
+            smoothed_targets = torch.zeros_like(logits)
+            smoothed_targets.fill_(self.label_smoothing / (n_classes - 1))
+            smoothed_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            
+            # Compute cross entropy with smooth labels
+            log_probs = F.log_softmax(logits, dim=-1)
+            CE = -(smoothed_targets * log_probs).sum(dim=-1)
+        else:
+            CE = F.cross_entropy(logits, targets, reduction='none')
+        
+        pt = torch.exp(-CE)
+        loss = self.alpha * (1 - pt)**self.gamma * CE
+
+        return {'total_loss': loss.mean() if self.reduction == 'mean' else loss}
+
+
+class WarmupCosineScheduler:
+    """Learning rate scheduler with warmup and cosine annealing"""
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.base_lr = optimizer.param_groups[0]['lr']
+        self.current_epoch = 0
+    
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            # Linear warmup
+            lr = self.base_lr * (self.current_epoch + 1) / self.warmup_epochs
+        else:
+            # Cosine annealing
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+        
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        self.current_epoch += 1
+        return lr
+
+
+def mixup_data(x1, x2, y, alpha=0.3):
+    """Apply mixup augmentation to embeddings"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x1.size(0)
+    index = torch.randperm(batch_size).to(x1.device)
+
+    mixed_x1 = lam * x1 + (1 - lam) * x1[index, :]
+    mixed_x2 = lam * x2 + (1 - lam) * x2[index, :]
+    y_a, y_b = y, y[index]
+    
+    return mixed_x1, mixed_x2, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute loss for mixup"""
+    loss_a = criterion(pred, y_a)['total_loss']
+    loss_b = criterion(pred, y_b)['total_loss']
+    return {'total_loss': lam * loss_a + (1 - lam) * loss_b}
+
+
+
+# ------------------------------
+#   MODEL IMPORT
+# ------------------------------
+
+class MultiClassDeceptionDetector(nn.Module):
+    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512, n_classes=4, n_monte_carlo=10, 
+                 dropout1=0.4, dropout2=0.3, num_heads=16, attention_dropout=0.1):
+        super(MultiClassDeceptionDetector, self).__init__()
+        
+        from test import EmbeddingFusion, UncertaintyQuantification
+        
+        # Enhanced fusion with more attention heads and dropout
+        self.fusion = EmbeddingFusion(
+            strategic_dim, 
+            text_dim, 
+            fusion_dim,
+            num_heads=num_heads,  # Configurable attention heads
+            attention_dropout=attention_dropout  # Attention-specific dropout
+        )
+        self.uncertainty = UncertaintyQuantification(fusion_dim)
+        self.n_monte_carlo = n_monte_carlo
+        
+        # DEEPER classification head: 512 → 256 → 128 → 64 → n_classes
+        self.classifier = nn.Sequential(
+            # Layer 1: 512 → 256
+            nn.Linear(fusion_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(dropout1),
+            
+            # Layer 2: 512 → 256
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout2),
+            
+            # Layer 3: 256 → 128
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(dropout2),
+            
+            # Layer 4: 128 → 64
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(dropout2 * 0.5),  # Reduced dropout near output
+            
+            # Layer 5: 64 → n_classes
+            nn.Linear(64, n_classes)
+        )
+        
+        # Residual projection from fusion to classification
+        self.residual_classifier = nn.Linear(fusion_dim, n_classes)
+        
+        self.consistency_head = nn.Linear(fusion_dim, 1)
+        self.confidence_head = nn.Linear(fusion_dim, 1)
+    
+    def forward(self, strategic_emb, text_emb, training=True):
+        fused_emb = self.fusion(strategic_emb, text_emb)
+        epistemic, aleatoric = self.uncertainty(fused_emb)
+        
+        if training:
+            # Main classification path
+            logits = self.classifier(fused_emb)
+            
+            # Residual skip connection
+            residual_logits = self.residual_classifier(fused_emb)
+            final_logits = logits + residual_logits  # Combine paths
+            
+            return {
+                'logits': final_logits,
+                'consistency_score': torch.sigmoid(self.consistency_head(fused_emb)),
+                'confidence_score': torch.sigmoid(self.confidence_head(fused_emb)),
+                'epistemic_uncertainty': epistemic,
+                'aleatoric_uncertainty': aleatoric
+            }
+        else:
+            self.train()
+            preds = []
+            for _ in range(self.n_monte_carlo):
+                logits = self.classifier(fused_emb)
+                residual_logits = self.residual_classifier(fused_emb)
+                final_logits = logits + residual_logits
+                preds.append(F.softmax(final_logits, dim=-1))
+            self.eval()
+            preds = torch.stack(preds)
+            
+            mean_pred = preds.mean(dim=0)
+            epistemic_unc = preds.var(dim=0).mean(dim=-1)
+            
+            return {
+                'probabilities': mean_pred,
+                'epistemic_uncertainty': epistemic_unc,
+                'aleatoric_uncertainty': aleatoric.squeeze(),
+            }
+
+
+# ------------------------------
+#   DATA PROCESSING
+# ------------------------------
+
 def load_and_preprocess_data(csv_path):
     df = pd.read_csv(csv_path)
+    
     df['sender_bool'] = df['sender_labels'].apply(parse_bool_label)
     df['receiver_bool'] = df['receiver_labels'].apply(parse_bool_label)
+    
     df['deception_state'] = df.apply(
         lambda r: deception_state_from_bools(r['sender_bool'], r['receiver_bool']),
         axis=1
     )
+    
     df = df[df['deception_state'].notna()]
     return df
 
@@ -275,175 +307,404 @@ def prepare_labels(df):
     return labels, encoder
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0
-    all_preds, all_labels = [], []
-    
-    for batch in loader:
-        strategic_emb = batch['strategic_embedding'].to(device)
-        text_emb = batch['text_embedding'].to(device)
-        labels = batch['label'].to(device)
-        
-        optimizer.zero_grad()
-        logits = model(strategic_emb, text_emb)
-        loss = criterion(logits, labels)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        total_loss += loss.item()
-        preds = torch.argmax(logits, dim=-1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-    
-    avg_loss = total_loss / len(loader)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    acc = accuracy_score(all_labels, all_preds)
-    
-    return avg_loss, f1, acc
+# ------------------------------
+#   ENHANCED TRAINING LOOP
+# ------------------------------
 
-
-def validate(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    all_preds, all_labels = [], []
+def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device, 
+                config, swa_model=None, swa_scheduler=None, save_dir="./checkpoints"):
+    """
+    Enhanced training loop with:
+    - Mixup augmentation
+    - Warmup + Cosine LR scheduling
+    - Stochastic Weight Averaging (SWA)
+    - Multi-metric early stopping
+    - Comprehensive metric tracking
+    """
+    os.makedirs(save_dir, exist_ok=True)
     
-    with torch.no_grad():
-        for batch in loader:
+    train_losses, val_losses, val_f1_scores = [], [], []
+    train_f1_scores, train_accs, val_accs = [], [], []
+    learning_rates = []
+    
+    best_val_f1 = 0.0
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    use_mixup = config.get('use_mixup', False)
+    mixup_alpha = config.get('mixup_alpha', 0.3)
+    use_swa = config.get('use_swa', False) and swa_model is not None
+    swa_start = config.get('swa_start_epoch', 30)
+    patience = config.get('patience', 10)
+    min_delta = config.get('min_delta', 0.0001)
+    n_epochs = config.get('n_epochs', 50)
+    
+    print(f"\n{'='*70}")
+    print("STARTING TRAINING")
+    print(f"{'='*70}")
+    print(f"Mixup: {use_mixup} | SWA: {use_swa} | Patience: {patience}")
+    print(f"{'='*70}\n")
+    
+    for epoch in range(n_epochs):
+        # ---- Training ----
+        model.train()
+        total_train_loss = 0
+        train_preds, train_targets = [], []
+        
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} - Training"):
             strategic_emb = batch['strategic_embedding'].to(device)
             text_emb = batch['text_embedding'].to(device)
             labels = batch['label'].to(device)
             
-            logits = model(strategic_emb, text_emb)
-            loss = criterion(logits, labels)
+            optimizer.zero_grad()
             
-            total_loss += loss.item()
-            preds = torch.argmax(logits, dim=-1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            # Apply mixup augmentation
+            if use_mixup and np.random.random() < 0.5:  # 50% probability
+                mixed_s, mixed_t, y_a, y_b, lam = mixup_data(strategic_emb, text_emb, labels, mixup_alpha)
+                outputs = model(mixed_s, mixed_t, training=True)
+                losses = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+            else:
+                outputs = model(strategic_emb, text_emb, training=True)
+                losses = criterion(outputs, labels)
+
+            losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            total_train_loss += losses['total_loss'].item()
+            train_preds.extend(torch.argmax(outputs['logits'], dim=-1).cpu().numpy())
+            train_targets.extend(labels.cpu().numpy())
+        
+        # ---- Validation ----
+        model.eval()
+        total_val_loss = 0
+        val_preds, val_targets = [], []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                strategic_emb = batch['strategic_embedding'].to(device)
+                text_emb = batch['text_embedding'].to(device)
+                labels = batch['label'].to(device)
+                
+                outputs = model(strategic_emb, text_emb, training=True)
+                losses = criterion(outputs, labels)
+                
+                total_val_loss += losses['total_loss'].item()
+                val_preds.extend(torch.argmax(outputs['logits'], dim=-1).cpu().numpy())
+                val_targets.extend(labels.cpu().numpy())
+        
+        # Calculate metrics
+        train_loss = total_train_loss / len(train_loader)
+        val_loss = total_val_loss / len(val_loader)
+        train_f1 = f1_score(train_targets, train_preds, average='weighted')
+        val_f1 = f1_score(val_targets, val_preds, average='weighted')
+        train_acc = (np.array(train_preds) == np.array(train_targets)).mean()
+        val_acc = (np.array(val_preds) == np.array(val_targets)).mean()
+        
+        # Store history
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_f1_scores.append(train_f1)
+        val_f1_scores.append(val_f1)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
+        # Update learning rate
+        current_lr = scheduler.step()
+        learning_rates.append(current_lr)
+        
+        # SWA update
+        if use_swa and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            if swa_scheduler is not None:
+                swa_scheduler.step()
+        
+        # Print progress
+        print(f"Epoch {epoch+1:3d}/{n_epochs} | " +
+              f"TrLoss: {train_loss:.4f} TrF1: {train_f1:.4f} TrAcc: {train_acc:.4f} | " +
+              f"VaLoss: {val_loss:.4f} VaF1: {val_f1:.4f} VaAcc: {val_acc:.4f} | " +
+              f"LR: {current_lr:.6f}")
+        
+        # Multi-metric early stopping (F1 improvement OR loss improvement)
+        f1_improved = val_f1 > (best_val_f1 + min_delta)
+        loss_improved = val_loss < (best_val_loss - min_delta)
+        
+        if f1_improved or loss_improved:
+            improvement_msg = []
+            if f1_improved:
+                best_val_f1 = val_f1
+                improvement_msg.append(f"F1: {val_f1:.4f}")
+            if loss_improved:
+                best_val_loss = val_loss
+                improvement_msg.append(f"Loss: {val_loss:.4f}")
+            
+            patience_counter = 0
+            
+            # Save best model
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_f1': val_f1,
+                'val_loss': val_loss
+            }
+            torch.save(save_dict, os.path.join(save_dir, "best_model.pth"))
+            print(f"  ✓ New best model saved ({', '.join(improvement_msg)})")
+        else:
+            patience_counter += 1
+            print(f"  Patience: {patience_counter}/{patience}")
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"\n{'='*70}")
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            print(f"{'='*70}\n")
+            break
     
-    avg_loss = total_loss / len(loader)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    acc = accuracy_score(all_labels, all_preds)
+    # Final SWA update
+    if use_swa and swa_model is not None:
+        print(f"\n{'='*70}")
+        print("Finalizing SWA model...")
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+        torch.save({
+            'model_state_dict': swa_model.module.state_dict(),
+        }, os.path.join(save_dir, "swa_model.pth"))
+        print(f"✓ SWA model saved")
+        print(f"{'='*70}\n")
     
-    return avg_loss, f1, acc, all_preds, all_labels
+    return {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_f1_scores': train_f1_scores,
+        'val_f1_scores': val_f1_scores,
+        'train_accs': train_accs,
+        'val_accs': val_accs,
+        'learning_rates': learning_rates,
+        'best_val_f1': best_val_f1,
+        'best_val_loss': best_val_loss
+    }
 
 
-def plot_history(history, save_dir):
-    epochs = range(1, len(history['train_loss']) + 1)
+def plot_training_history(history, save_dir):
+    """Plot enhanced training metrics and save to file"""
+    epochs = range(1, len(history['train_losses']) + 1)
     
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
-    # Loss
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
-    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
-    axes[0, 0].set_title('Loss', fontsize=14, fontweight='bold')
-    axes[0, 0].set_xlabel('Epoch')
+    # Plot 1: Losses
+    axes[0, 0].plot(epochs, history['train_losses'], 'b-', label='Training Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_losses'], 'r-', label='Validation Loss', linewidth=2)
+    axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    axes[0, 0].set_xlabel('Epochs')
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # F1 Score
-    axes[0, 1].plot(epochs, history['train_f1'], 'b-', label='Train', linewidth=2)
-    axes[0, 1].plot(epochs, history['val_f1'], 'r-', label='Validation', linewidth=2)
+    # Plot 2: F1 Scores
+    axes[0, 1].plot(epochs, history['train_f1_scores'], 'b-', label='Training F1', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_f1_scores'], 'g-', label='Validation F1', linewidth=2)
     axes[0, 1].set_title('F1 Score', fontsize=14, fontweight='bold')
-    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_xlabel('Epochs')
     axes[0, 1].set_ylabel('F1 Score')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
     
-    # Accuracy
-    axes[1, 0].plot(epochs, history['train_acc'], 'b-', label='Train', linewidth=2)
-    axes[1, 0].plot(epochs, history['val_acc'], 'r-', label='Validation', linewidth=2)
-    axes[1, 0].set_title('Accuracy', fontsize=14, fontweight='bold')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Accuracy')
-    axes[1, 0].legend()
+    # Plot 3: Accuracy
+    axes[0, 2].plot(epochs, history['train_accs'], 'b-', label='Training Acc', linewidth=2)
+    axes[0, 2].plot(epochs, history['val_accs'], 'orange', label='Validation Acc', linewidth=2)
+    axes[0, 2].set_title('Accuracy', fontsize=14, fontweight='bold')
+    axes[0, 2].set_xlabel('Epochs')
+    axes[0, 2].set_ylabel('Accuracy')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # Plot 4: Learning Rate
+    axes[1, 0].plot(epochs, history['learning_rates'], 'purple', linewidth=2)
+    axes[1, 0].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    axes[1, 0].set_xlabel('Epochs')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_yscale('log')
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Overfitting Gap
-    gap = [t - v for t, v in zip(history['train_loss'], history['val_loss'])]
-    axes[1, 1].plot(epochs, gap, 'purple', linewidth=2)
+    # Plot 5: Overfitting Gap
+    gap = [t - v for t, v in zip(history['train_losses'], history['val_losses'])]
+    axes[1, 1].plot(epochs, gap, 'red', linewidth=2)
     axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
     axes[1, 1].set_title('Overfitting Gap (Train - Val Loss)', fontsize=14, fontweight='bold')
-    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_xlabel('Epochs')
     axes[1, 1].set_ylabel('Loss Difference')
     axes[1, 1].grid(True, alpha=0.3)
+    
+    # Plot 6: F1 Comparison
+    axes[1, 2].bar(['Train', 'Val'], 
+                   [history['train_f1_scores'][-1], history['val_f1_scores'][-1]],
+                   color=['blue', 'green'], alpha=0.7)
+    axes[1, 2].set_title('Final F1 Scores', fontsize=14, fontweight='bold')
+    axes[1, 2].set_ylabel('F1 Score')
+    axes[1, 2].set_ylim([0, 1])
+    axes[1, 2].grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'training_history.png'), dpi=150)
     plt.close()
-    print(f"✓ Plot saved to {save_dir}/training_history.png")
+    print(f"✓ Training history plot saved to {save_dir}/training_history.png")
 
+
+# ------------------------------
+#   EVALUATION
+# ------------------------------
+
+def evaluate_swa_model(test_loader, swa_model, device, label_encoder):
+    """Evaluate SWA (Stochastic Weight Averaging) model"""
+    print("\n" + "="*70)
+    print("SWA MODEL EVALUATION")
+    print("="*70)
+    
+    swa_model.eval()
+    preds, trues = [], []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            strategic_emb = batch['strategic_embedding'].to(device)
+            text_emb = batch['text_embedding'].to(device)
+            labels = batch['label'].to(device)
+            
+            output = swa_model(strategic_emb, text_emb, training=False)
+            pred = torch.argmax(output['probabilities'], dim=-1)
+            
+            preds.extend(pred.cpu().numpy())
+            trues.extend(labels.cpu().numpy())
+    
+    # Calculate metrics
+    from sklearn.metrics import accuracy_score
+    acc = accuracy_score(trues, preds)
+    f1 = f1_score(trues, preds, average='weighted')
+    
+    print(f"\n✓ SWA Test Accuracy: {acc:.4f}")
+    print(f"✓ SWA Test F1: {f1:.4f}\n")
+    
+    print("Classification Report:")
+    print(classification_report(trues, preds, target_names=label_encoder.classes_))
+    
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(trues, preds)
+    print(cm)
+    
+    print("\nPer-Class Metrics:")
+    for i, cls in enumerate(label_encoder.classes_):
+        cls_acc = cm[i, i] / cm[i].sum() if cm[i].sum() > 0 else 0
+        print(f"  {cls:25s} - Accuracy: {cls_acc:.4f} ({cm[i, i]}/{cm[i].sum()})")
+    
+    return acc, f1
+
+
+def evaluate_model(test_loader, model, device, label_encoder):
+    model.eval()
+    preds, trues = [], []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            strategic_emb = batch['strategic_embedding'].to(device)
+            text_emb = batch['text_embedding'].to(device)
+            labels = batch['label'].to(device)
+            
+            output = model(strategic_emb, text_emb, training=False)
+            pred = torch.argmax(output['probabilities'], dim=-1)
+            
+            preds.extend(pred.cpu().numpy())
+            trues.extend(labels.cpu().numpy())
+    
+    print("\nClassification Report:")
+    print(classification_report(trues, preds, target_names=label_encoder.classes_))
+    
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(trues, preds))
+
+
+# ------------------------------
+#   MAIN TRAINING PIPELINE
+# ------------------------------
 
 def main():
-    use_attention = True  # Set to True for CrossAttention, False for Simple model
-    
     config = {
         'csv_path': 'data/final_dataset1.csv',
         'model_path': 'test_allminilm_finetuned-20250829T234732Z-1-001/test_allminilm_finetuned',
         'strategic_dim': 256,
         'text_dim': 256,
+        'fusion_dim': 512,
         'batch_size': 32,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-3,  # Strong regularization
-        'dropout': 0.4,
-        'num_heads': 4,  # Number of attention heads for cross-attention
-        'use_attention': use_attention,
-        'n_epochs': 60,
-        'patience': 20,
+        'learning_rate': 1.532033526528867e-4,
+        'n_epochs': 25,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        'save_dir': f'./{"attention" if use_attention else "simple"}_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+        
+        # Enhanced regularization params
+        'smote_k_neighbors': 7,
+        'label_smoothing': 0.1,
+        'use_mixup': True,
+        'mixup_alpha': 0.3,
+        'dropout1': 0.22798466779344834,
+        'dropout2': 0.293627659799008,
+        
+        # Training improvements
+        'warmup_epochs': 5,
+        'use_swa': True,
+        'swa_start_epoch': 20,  # 60% of 25 epochs
+        'patience': 10,
+        'min_delta': 0.0001,
+        
+        # Architecture enhancements
+        'num_heads': 16,  # Attention heads (increased from 8)
+        'attention_dropout': 0.1,  # Attention-specific dropout
+        
+        # Loss params
+        'focal_alpha': 0.78530692087020266,
+        'focal_gamma': 2.740172718188119,
+        'weight_decay': 1.1615339145351501e-05
     }
     
     print("="*70)
-    print("DECEPTION DETECTION MODEL")
-    print("Cross-Attention Fusion" if config['use_attention'] else "Simple Concatenation")
+    print("ENHANCED DECEPTION DETECTION MODEL")
     print("="*70)
     for k, v in config.items():
         print(f"  {k}: {v}")
-    print()
+    print("="*70)
 
-    os.makedirs(config['save_dir'], exist_ok=True)
-
-    # Load data
+    # ---- Load data ----
     df = load_and_preprocess_data(config['csv_path'])
-    print(f"✓ Loaded {len(df)} samples")
-    print(f"  Class distribution:\n{df['deception_state'].value_counts()}\n")
 
-    # Generate embeddings
-    print("Generating embeddings...")
+    # ---- Embeddings ----
     text_emb, strat_emb = generate_embeddings(df, config['model_path'])
+
+    # ---- Labels ----
     labels, label_encoder = prepare_labels(df)
-    print(f"✓ Text embeddings: {text_emb.shape}")
-    print(f"✓ Strategic embeddings: {strat_emb.shape}\n")
-
-    print(f"✓ Strategic embeddings: {strat_emb.shape}\n")
 
     # -------------------------
-    #  SMOTE + TOMEK
+    #  SMOTE + TOMEK (IMPROVED)
     # -------------------------
+
     print("Fusing embeddings for SMOTE+Tomek...")
     fused = np.concatenate([text_emb, strat_emb], axis=1)
 
-    print("Applying SMOTETomek (this handles imbalance better than weights)...")
-    # Using SMOTETomek to oversample minority AND clean overlapping majority
-    smt = SMOTETomek(random_state=42)
+    print(f"Applying SMOTETomek (k_neighbors={config.get('smote_k_neighbors', 5)})...")
+    print(f"Original class distribution: {np.bincount(labels)}")
+    
+    # Using SMOTETomek: oversample minority AND remove Tomek links (noise)
+    smt = SMOTETomek(
+        smote=SMOTE(k_neighbors=config.get('smote_k_neighbors', 5), random_state=42),
+        random_state=42
+    )
     fused_resampled, labels_resampled = smt.fit_resample(fused, labels)
     
+    print(f"Resampled class distribution: {np.bincount(labels_resampled)}")
+
     # Un-fuse
     text_dim = text_emb.shape[1]
     X_text = fused_resampled[:, :text_dim]
     X_strat = fused_resampled[:, text_dim:]
     y = labels_resampled
-    
-    print(f"✓ Original size: {len(labels)}")
-    print(f"✓ Resampled size: {len(y)}")
-    
-    # Split
-    print("Splitting data (Train/Val/Test)...")
+
+    # ---- Train / Val / Test Split ----
     X_text_train, X_text_temp, X_strat_train, X_strat_temp, y_train, y_temp = train_test_split(
         X_text, X_strat, y, test_size=0.3, random_state=42, stratify=y
     )
@@ -452,152 +713,142 @@ def main():
         X_text_temp, X_strat_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
     )
 
-    print(f"✓ Train: {len(y_train)} samples")
-    print(f"✓ Val:   {len(y_val)} samples")
-    print(f"✓ Test:  {len(y_test)} samples\n")
-
-    # Create datasets
+    # ---- Dataloaders ----
     train_dataset = DeceptionDataset(X_text_train, X_strat_train, y_train)
-    val_dataset = DeceptionDataset(X_text_val, X_strat_val, y_val)
-    test_dataset = DeceptionDataset(X_text_test, X_strat_test, y_test)
+    val_dataset   = DeceptionDataset(X_text_val, X_strat_val, y_val)
+    test_dataset  = DeceptionDataset(X_text_test, X_strat_test, y_test)
 
-    # Standard loaders (SMOTE balanced the data, so no weighted sampler needed)
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
+    # Weighted sampler for balanced training
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    sample_weights = class_weights[y_train]
 
-    # Create model based on configuration
-    if config['use_attention']:
-        model = CrossAttentionDeceptionClassifier(
-            strategic_dim=config['strategic_dim'],
-            text_dim=config['text_dim'],
-            n_classes=len(label_encoder.classes_),
-            num_heads=config['num_heads'],
-            dropout=config['dropout']
-        ).to(config['device'])
-        print(f"✓ Using CrossAttentionDeceptionClassifier with {config['num_heads']} attention heads")
-    else:
-        model = SimpleDeceptionClassifier(
-            strategic_dim=config['strategic_dim'],
-            text_dim=config['text_dim'],
-            n_classes=len(label_encoder.classes_),
-            dropout=config['dropout']
-        ).to(config['device'])
-        print("✓ Using SimpleDeceptionClassifier (concatenation-based)")
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        sampler=torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
+    )
 
-    print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters\n")
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
 
-    # Focal Loss (better for hard examples)
-    # Alpha can be tuned, reducing it slightly since SMOTE balanced the data
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    # ---- Model ----
+    print(f"\n{'='*70}")
+    print("INITIALIZING MODEL")
+    print(f"{'='*70}")
+    
+    model = MultiClassDeceptionDetector(
+        strategic_dim=config['strategic_dim'],
+        text_dim=config['text_dim'],
+        fusion_dim=config['fusion_dim'],
+        n_classes=len(label_encoder.classes_),
+        dropout1=config['dropout1'],
+        dropout2=config['dropout2'],
+        num_heads=config.get('num_heads', 16),  # Enhanced attention
+        attention_dropout=config.get('attention_dropout', 0.1)  # Attention dropout
+    ).to(config['device'])
+    
+    print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters")
+    print(f"✓ Architecture: {config.get('num_heads', 16)} attention heads, deeper 5-layer classifier")
 
-    # Optimizer
-    optimizer = optim.AdamW(
+    # Enhanced FocalLoss with label smoothing
+    criterion = FocalLoss(
+        alpha=config['focal_alpha'],
+        gamma=config['focal_gamma'],
+        label_smoothing=config['label_smoothing']
+    )
+    print(f"✓ FocalLoss (alpha={config['focal_alpha']:.3f}, gamma={config['focal_gamma']:.3f}, " +
+          f"smoothing={config['label_smoothing']})")
+    
+    # Optimizer with weight decay
+    optimizer = optim.Adam(
         model.parameters(),
         lr=config['learning_rate'],
         weight_decay=config['weight_decay']
     )
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['n_epochs'])
+    # Warmup Cosine Scheduler
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_epochs=config['warmup_epochs'],
+        total_epochs=config['n_epochs']
+    )
+    print(f"✓ WarmupCosineScheduler (warmup={config['warmup_epochs']} epochs)")
+    
+    # SWA (Stochastic Weight Averaging)
+    swa_model = None
+    if config['use_swa']:
+        from torch.optim.swa_utils import AveragedModel, SWALR
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(optimizer, swa_lr=config['learning_rate'] * 0.1)
+        print(f"✓ SWA enabled (start_epoch={config['swa_start_epoch']})")
+    
+    print(f"{'='*70}\n")
 
-    # Training loop
-    print("="*70)
-    print("TRAINING")
-    print("="*70)
-    
-    history = {
-        'train_loss': [], 'train_f1': [], 'train_acc': [],
-        'val_loss': [], 'val_f1': [], 'val_acc': []
-    }
-    
-    best_val_f1 = 0.0
-    patience_counter = 0
-    
-    for epoch in range(config['n_epochs']):
-        # Train
-        train_loss, train_f1, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, config['device']
-        )
-        
-        # Validate
-        val_loss, val_f1, val_acc, _, _ = validate(
-            model, val_loader, criterion, config['device']
-        )
-        
-        # Store history
-        history['train_loss'].append(train_loss)
-        history['train_f1'].append(train_f1)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_f1'].append(val_f1)
-        history['val_acc'].append(val_acc)
-        
-        # Print
-        print(f"Epoch {epoch+1:3d}/{config['n_epochs']} | "
-              f"TrLoss: {train_loss:.4f} TrF1: {train_f1:.4f} TrAcc: {train_acc:.4f} | "
-              f"VaLoss: {val_loss:.4f} VaF1: {val_f1:.4f} VaAcc: {val_acc:.4f}")
-        
-        # Save best
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_f1': val_f1
-            }, os.path.join(config['save_dir'], "best_model.pth"))
-            print(f"  ✓ New best model saved (F1: {val_f1:.4f})")
-        else:
-            patience_counter += 1
-        
-        # Early stopping
-        if patience_counter >= config['patience']:
-            print(f"\nEarly stopping at epoch {epoch+1}")
-            break
-        
-        scheduler.step()
-    
-    # Plot
-    plot_history(history, config['save_dir'])
+    # ---- Train ----
+    history = train_model(
+        train_loader, val_loader, model,
+        criterion, optimizer, scheduler,
+        config['device'], config,
+        swa_model=swa_model if config['use_swa'] else None,
+        swa_scheduler=swa_scheduler if config['use_swa'] else None,
+        save_dir=config['save_dir']
+    )
 
-    # Test evaluation
-    print("\n" + "="*70)
-    print("TEST SET EVALUATION")
-    print("="*70)
-    
+    # Plot metrics
+    plot_training_history(history, config['save_dir'])
+
+    # ---- Evaluate ----
+    print("Loading best model...")
     checkpoint = torch.load(
         os.path.join(config['save_dir'], "best_model.pth"),
         map_location=config['device'],
-        weights_only=False
+        weights_only=False  # PyTorch 2.6 compatibility
     )
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    _, test_f1, test_acc, test_preds, test_labels = validate(
-        model, test_loader, criterion, config['device']
-    )
-    
-    print(f"\nTest F1:       {test_f1:.4f}")
-    print(f"Test Accuracy: {test_acc:.4f}\n")
-    
-    print("Classification Report:")
-    print(classification_report(test_labels, test_preds, 
-                                target_names=label_encoder.classes_, digits=4))
-    
-    print("\nConfusion Matrix:")
-    cm = confusion_matrix(test_labels, test_preds)
-    print(cm)
-    
-    print("\nPer-Class Metrics:")
-    for i, cls in enumerate(label_encoder.classes_):
-        cls_acc = cm[i, i] / cm[i].sum() if cm[i].sum() > 0 else 0
-        print(f"  {cls:25s} - Accuracy: {cls_acc:.4f} ({cm[i, i]}/{cm[i].sum()})")
-    
-    print("\n" + "="*70)
-    print(f"BEST VALIDATION F1: {best_val_f1:.4f}")
-    print(f"FINAL TEST F1:      {test_f1:.4f}")
-    print(f"Results saved to: {config['save_dir']}")
-    print("="*70)
+
+    evaluate_model(test_loader, model, config['device'], label_encoder)
+
+    # ---- Evaluate SWA Model (if available) ----
+    if config['use_swa'] and os.path.exists(os.path.join(config['save_dir'], "swa_model.pth")):
+        print("\n" + "="*70)
+        print("Loading SWA model for comparison...")
+        print("="*70)
+        
+        swa_checkpoint = torch.load(
+            os.path.join(config['save_dir'], "swa_model.pth"),
+            map_location=config['device'],
+            weights_only=False
+        )
+        
+        # Create a new model instance for SWA
+        swa_model = MultiClassDeceptionDetector(
+            strategic_dim=config['strategic_dim'],
+            text_dim=config['text_dim'],
+            fusion_dim=config['fusion_dim'],
+            n_classes=len(label_encoder.classes_),
+            dropout1=config['dropout1'],
+            dropout2=config['dropout2'],
+            num_heads=config.get('num_heads', 16),
+            attention_dropout=config.get('attention_dropout', 0.1)
+        ).to(config['device'])
+        
+        swa_model.load_state_dict(swa_checkpoint['model_state_dict'])
+        
+        swa_acc, swa_f1 = evaluate_swa_model(test_loader, swa_model, config['device'], label_encoder)
+        
+        # Compare results
+        print("\n" + "="*70)
+        print("MODEL COMPARISON")
+        print("="*70)
+        print(f"Best Checkpoint - Val F1: {history['best_val_f1']:.4f}")
+        print(f"SWA Model       - Test F1: {swa_f1:.4f}")
+        if swa_f1 > history['best_val_f1']:
+            print(f"✓ SWA model is BETTER by {(swa_f1 - history['best_val_f1'])*100:.2f}%!")
+        else:
+            print(f"Best checkpoint is better by {(history['best_val_f1'] - swa_f1)*100:.2f}%")
+        print("="*70)
+
+    print(f"\nTraining complete. Best Val F1 = {history['best_val_f1']:.4f}")
 
 
 if __name__ == "__main__":
