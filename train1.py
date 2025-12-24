@@ -1,30 +1,47 @@
+"""
+SIMPLER BASELINE - Try this if the complex model keeps overfitting
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import pickle
 import os
-import json
 from datetime import datetime
-from imblearn.over_sampling import SMOTE
 
-# Import your existing modules
 from sentence_transformers import SentenceTransformer
 from gnn import get_strategic_embeddings
+from imblearn.combine import SMOTETomek
 
 
-# ------------------------------
-#  DATASET + SAMPLER
-# ------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 
 class DeceptionDataset(Dataset):
     def __init__(self, text_embeddings, strategic_embeddings, labels):
@@ -37,15 +54,40 @@ class DeceptionDataset(Dataset):
     
     def __getitem__(self, idx):
         return {
-        'text_embedding': torch.FloatTensor(self.text_embeddings[idx]),
-        'strategic_embedding': torch.FloatTensor(self.strategic_embeddings[idx]),
-        'label': torch.tensor(self.labels[idx], dtype=torch.long)
-    }
+            'text_embedding': torch.FloatTensor(self.text_embeddings[idx]),
+            'strategic_embedding': torch.FloatTensor(self.strategic_embeddings[idx]),
+            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+        }
 
 
-# ------------------------------
-#   LABEL PROCESSING HELPERS
-# ------------------------------
+class SimpleDeceptionClassifier(nn.Module):
+    """Much simpler architecture to reduce overfitting"""
+    def __init__(self, strategic_dim=256, text_dim=256, n_classes=2, dropout=0.3):
+        super(SimpleDeceptionClassifier, self).__init__()
+        
+        # Simple concatenation fusion
+        input_dim = strategic_dim + text_dim
+        
+        # Smaller, simpler network
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(256, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(64, n_classes)
+        )
+    
+    def forward(self, strategic_emb, text_emb):
+        # Simple concatenation
+        x = torch.cat([strategic_emb, text_emb], dim=-1)
+        return self.network(x)
+
 
 def parse_bool_label(v):
     if pd.isna(v):
@@ -71,99 +113,14 @@ def deception_state_from_bools(sender_b, receiver_b):
         return 'successful_deception'
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha, gamma, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        if isinstance(inputs, dict):
-            logits = inputs['logits']
-        else:
-            logits = inputs
-
-        CE = F.cross_entropy(logits, targets, reduction='none')
-        pt = torch.exp(-CE)
-        loss = self.alpha * (1 - pt)**self.gamma * CE
-
-        return {'total_loss': loss.mean() if self.reduction == 'mean' else loss}
-
-
-# ------------------------------
-#   MODEL IMPORT
-# ------------------------------
-
-class MultiClassDeceptionDetector(nn.Module):
-    def __init__(self, strategic_dim=256, text_dim=256, fusion_dim=512, n_classes=4, n_monte_carlo=10, dropout1=0.4, dropout2=0.3):
-        super(MultiClassDeceptionDetector, self).__init__()
-        
-        from test import EmbeddingFusion, UncertaintyQuantification
-        
-        self.fusion = EmbeddingFusion(strategic_dim, text_dim, fusion_dim)
-        self.uncertainty = UncertaintyQuantification(fusion_dim)
-        self.n_monte_carlo = n_monte_carlo
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout1),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout2),
-            nn.Linear(128, n_classes)
-        )
-        
-        self.consistency_head = nn.Linear(fusion_dim, 1)
-        self.confidence_head = nn.Linear(fusion_dim, 1)
-    
-    def forward(self, strategic_emb, text_emb, training=True):
-        fused_emb = self.fusion(strategic_emb, text_emb)
-        epistemic, aleatoric = self.uncertainty(fused_emb)
-        
-        if training:
-            logits = self.classifier(fused_emb)
-            return {
-                'logits': logits,
-                'consistency_score': torch.sigmoid(self.consistency_head(fused_emb)),
-                'confidence_score': torch.sigmoid(self.confidence_head(fused_emb)),
-                'epistemic_uncertainty': epistemic,
-                'aleatoric_uncertainty': aleatoric
-            }
-        else:
-            self.train()
-            preds = []
-            for _ in range(self.n_monte_carlo):
-                preds.append(F.softmax(self.classifier(fused_emb), dim=-1))
-            self.eval()
-            preds = torch.stack(preds)
-            
-            mean_pred = preds.mean(dim=0)
-            epistemic_unc = preds.var(dim=0).mean(dim=-1)
-            
-            return {
-                'probabilities': mean_pred,
-                'epistemic_uncertainty': epistemic_unc,
-                'aleatoric_uncertainty': aleatoric.squeeze(),
-            }
-
-
-# ------------------------------
-#   DATA PROCESSING
-# ------------------------------
-
 def load_and_preprocess_data(csv_path):
     df = pd.read_csv(csv_path)
-    
     df['sender_bool'] = df['sender_labels'].apply(parse_bool_label)
     df['receiver_bool'] = df['receiver_labels'].apply(parse_bool_label)
-    
     df['deception_state'] = df.apply(
         lambda r: deception_state_from_bools(r['sender_bool'], r['receiver_bool']),
         axis=1
     )
-    
     df = df[df['deception_state'].notna()]
     return df
 
@@ -201,148 +158,108 @@ def prepare_labels(df):
     return labels, encoder
 
 
-# ------------------------------
-#   TRAINING LOOP
-# ------------------------------
-
-def train_model(train_loader, val_loader, model, criterion, optimizer, scheduler, device, n_epochs=50, save_dir="./checkpoints"):
+def train_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    all_preds, all_labels = [], []
     
-    os.makedirs(save_dir, exist_ok=True)
+    for batch in loader:
+        strategic_emb = batch['strategic_embedding'].to(device)
+        text_emb = batch['text_embedding'].to(device)
+        labels = batch['label'].to(device)
+        
+        optimizer.zero_grad()
+        logits = model(strategic_emb, text_emb)
+        loss = criterion(logits, labels)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        total_loss += loss.item()
+        preds = torch.argmax(logits, dim=-1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
     
-    train_losses, val_losses, val_f1_scores = [], [], []
-    best_val_f1 = 0.0
+    avg_loss = total_loss / len(loader)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    acc = accuracy_score(all_labels, all_preds)
     
-    for epoch in range(n_epochs):
-        # ---- Training ----
-        model.train()
-        total_train_loss = 0
-        train_preds, train_targets = [], []
-        
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} - Training"):
-            strategic_emb = batch['strategic_embedding'].to(device)
-            text_emb = batch['text_embedding'].to(device)
-            labels = batch['label'].to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(strategic_emb, text_emb, training=True)
-            losses = criterion(outputs, labels)
-
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            total_train_loss += losses['total_loss'].item()
-            train_preds.extend(torch.argmax(outputs['logits'], dim=-1).cpu().numpy())
-            train_targets.extend(labels.cpu().numpy())
-        
-        # ---- Validation ----
-        model.eval()
-        total_val_loss = 0
-        val_preds, val_targets = [], []
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                strategic_emb = batch['strategic_embedding'].to(device)
-                text_emb = batch['text_embedding'].to(device)
-                labels = batch['label'].to(device)
-                
-                outputs = model(strategic_emb, text_emb, training=True)
-                losses = criterion(outputs, labels)
-                
-                total_val_loss += losses['total_loss'].item()
-                val_preds.extend(torch.argmax(outputs['logits'], dim=-1).cpu().numpy())
-                val_targets.extend(labels.cpu().numpy())
-        
-        train_loss = total_train_loss / len(train_loader)
-        val_loss = total_val_loss / len(val_loader)
-        val_f1 = f1_score(val_targets, val_preds, average='weighted')
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_f1_scores.append(val_f1)
-        
-        print(f"Epoch {epoch+1}: TrainLoss={train_loss:.4f}  ValLoss={val_loss:.4f}  ValF1={val_f1:.4f}")
-        
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict()
-            }, os.path.join(save_dir, "best_model.pth"))
-            print("New best model saved.")
-        
-        scheduler.step(val_loss)
-    
-    return {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'val_f1_scores': val_f1_scores,
-        'best_val_f1': best_val_f1
-    }
+    return avg_loss, f1, acc
 
 
-def plot_training_history(history, save_dir):
-    """Plot training metrics and save to file"""
-    epochs = range(1, len(history['train_losses']) + 1)
-    
-    plt.figure(figsize=(12, 5))
-    
-    # Plot Losses
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, history['train_losses'], 'b-', label='Training Loss')
-    plt.plot(epochs, history['val_losses'], 'r-', label='Validation Loss')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot F1 Score
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, history['val_f1_scores'], 'g-', label='Validation F1')
-    plt.title('Validation F1 Score')
-    plt.xlabel('Epochs')
-    plt.ylabel('F1 Score')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'training_history.png'))
-    plt.close()
-    print(f"Training history plot saved to {save_dir}/training_history.png")
-
-
-# ------------------------------
-#   EVALUATION
-# ------------------------------
-
-def evaluate_model(test_loader, model, device, label_encoder):
+def validate(model, loader, criterion, device):
     model.eval()
-    preds, trues = [], []
+    total_loss = 0
+    all_preds, all_labels = [], []
     
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in loader:
             strategic_emb = batch['strategic_embedding'].to(device)
             text_emb = batch['text_embedding'].to(device)
             labels = batch['label'].to(device)
             
-            output = model(strategic_emb, text_emb, training=False)
-            pred = torch.argmax(output['probabilities'], dim=-1)
+            logits = model(strategic_emb, text_emb)
+            loss = criterion(logits, labels)
             
-            preds.extend(pred.cpu().numpy())
-            trues.extend(labels.cpu().numpy())
+            total_loss += loss.item()
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
-    print("\nClassification Report:")
-    print(classification_report(trues, preds, target_names=label_encoder.classes_))
+    avg_loss = total_loss / len(loader)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    acc = accuracy_score(all_labels, all_preds)
     
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(trues, preds))
+    return avg_loss, f1, acc, all_preds, all_labels
 
 
-# ------------------------------
-#   MAIN TRAINING PIPELINE
-# ------------------------------
+def plot_history(history, save_dir):
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Loss
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
+    axes[0, 0].set_title('Loss', fontsize=14, fontweight='bold')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # F1 Score
+    axes[0, 1].plot(epochs, history['train_f1'], 'b-', label='Train', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_f1'], 'r-', label='Validation', linewidth=2)
+    axes[0, 1].set_title('F1 Score', fontsize=14, fontweight='bold')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('F1 Score')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Accuracy
+    axes[1, 0].plot(epochs, history['train_acc'], 'b-', label='Train', linewidth=2)
+    axes[1, 0].plot(epochs, history['val_acc'], 'r-', label='Validation', linewidth=2)
+    axes[1, 0].set_title('Accuracy', fontsize=14, fontweight='bold')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Accuracy')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Overfitting Gap
+    gap = [t - v for t, v in zip(history['train_loss'], history['val_loss'])]
+    axes[1, 1].plot(epochs, gap, 'purple', linewidth=2)
+    axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[1, 1].set_title('Overfitting Gap (Train - Val Loss)', fontsize=14, fontweight='bold')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Loss Difference')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_history.png'), dpi=150)
+    plt.close()
+    print(f"✓ Plot saved to {save_dir}/training_history.png")
+
 
 def main():
     config = {
@@ -350,43 +267,61 @@ def main():
         'model_path': 'test_allminilm_finetuned-20250829T234732Z-1-001/test_allminilm_finetuned',
         'strategic_dim': 256,
         'text_dim': 256,
-        'fusion_dim': 512,
         'batch_size': 32,
-        'learning_rate': 3.532033526528867e-4,
-        'n_epochs': 25,
+        'learning_rate': 1e-4,
+        'weight_decay': 1e-3,  # Strong regularization
+        'dropout': 0.4,
+        'n_epochs': 100,
+        'patience': 20,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        'save_dir': f'./simple_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     }
     
-    print(config)
+    print("="*70)
+    print("SIMPLE BASELINE MODEL")
+    print("="*70)
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    print()
 
-    # ---- Load data ----
+    os.makedirs(config['save_dir'], exist_ok=True)
+
+    # Load data
     df = load_and_preprocess_data(config['csv_path'])
+    print(f"✓ Loaded {len(df)} samples")
+    print(f"  Class distribution:\n{df['deception_state'].value_counts()}\n")
 
-    # ---- Embeddings ----
+    # Generate embeddings
+    print("Generating embeddings...")
     text_emb, strat_emb = generate_embeddings(df, config['model_path'])
-
-    # ---- Labels ----
     labels, label_encoder = prepare_labels(df)
+    print(f"✓ Text embeddings: {text_emb.shape}")
+    print(f"✓ Strategic embeddings: {strat_emb.shape}\n")
+
+    print(f"✓ Strategic embeddings: {strat_emb.shape}\n")
 
     # -------------------------
-    #  OPTION A — FUSED SMOTE
+    #  SMOTE + TOMEK
     # -------------------------
-
-    print("Fusing embeddings...")
+    print("Fusing embeddings for SMOTE+Tomek...")
     fused = np.concatenate([text_emb, strat_emb], axis=1)
 
-    print("Applying SMOTE...")
-    sm = SMOTE(k_neighbors=4, random_state=42)
-    fused_resampled, labels_resampled = sm.fit_resample(fused, labels)
-
+    print("Applying SMOTETomek (this handles imbalance better than weights)...")
+    # Using SMOTETomek to oversample minority AND clean overlapping majority
+    smt = SMOTETomek(random_state=42)
+    fused_resampled, labels_resampled = smt.fit_resample(fused, labels)
+    
     # Un-fuse
     text_dim = text_emb.shape[1]
     X_text = fused_resampled[:, :text_dim]
     X_strat = fused_resampled[:, text_dim:]
     y = labels_resampled
-
-    # ---- Train / Val / Test Split ----
+    
+    print(f"✓ Original size: {len(labels)}")
+    print(f"✓ Resampled size: {len(y)}")
+    
+    # Split
+    print("Splitting data (Train/Val/Test)...")
     X_text_train, X_text_temp, X_strat_train, X_strat_temp, y_train, y_temp = train_test_split(
         X_text, X_strat, y, test_size=0.3, random_state=42, stratify=y
     )
@@ -395,56 +330,141 @@ def main():
         X_text_temp, X_strat_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
     )
 
-    # ---- Dataloaders ----
+    print(f"✓ Train: {len(y_train)} samples")
+    print(f"✓ Val:   {len(y_val)} samples")
+    print(f"✓ Test:  {len(y_test)} samples\n")
+
+    # Create datasets
     train_dataset = DeceptionDataset(X_text_train, X_strat_train, y_train)
-    val_dataset   = DeceptionDataset(X_text_val, X_strat_val, y_val)
-    test_dataset  = DeceptionDataset(X_text_test, X_strat_test, y_test)
+    val_dataset = DeceptionDataset(X_text_val, X_strat_val, y_val)
+    test_dataset = DeceptionDataset(X_text_test, X_strat_test, y_test)
 
-    # Weighted sampler for balanced training
-    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-    sample_weights = class_weights[y_train]
+    # Standard loaders (SMOTE balanced the data, so no weighted sampler needed)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        sampler=torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
-    )
-
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
-
-    # ---- Model ----
-    model = MultiClassDeceptionDetector(
+    # Simple model
+    model = SimpleDeceptionClassifier(
         strategic_dim=config['strategic_dim'],
         text_dim=config['text_dim'],
-        fusion_dim=config['fusion_dim'],
         n_classes=len(label_encoder.classes_),
-        dropout1=0.22798466779344834,
-        dropout2=0.293627659799008
+        dropout=config['dropout']
     ).to(config['device'])
 
-    criterion = FocalLoss(alpha=0.32910692087020266, gamma=2.040172718188119)
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1.1615339145351501e-05)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+    print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters\n")
 
-    # ---- Train ----
-    history = train_model(
-        train_loader, val_loader, model,
-        criterion, optimizer, scheduler,
-        config['device'], config['n_epochs'], config['save_dir']
+    # Focal Loss (better for hard examples)
+    # Alpha can be tuned, reducing it slightly since SMOTE balanced the data
+    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+
+    # Optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay']
     )
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['n_epochs'])
 
-    # Plot metrics
-    plot_training_history(history, config['save_dir'])
+    # Training loop
+    print("="*70)
+    print("TRAINING")
+    print("="*70)
+    
+    history = {
+        'train_loss': [], 'train_f1': [], 'train_acc': [],
+        'val_loss': [], 'val_f1': [], 'val_acc': []
+    }
+    
+    best_val_f1 = 0.0
+    patience_counter = 0
+    
+    for epoch in range(config['n_epochs']):
+        # Train
+        train_loss, train_f1, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, config['device']
+        )
+        
+        # Validate
+        val_loss, val_f1, val_acc, _, _ = validate(
+            model, val_loader, criterion, config['device']
+        )
+        
+        # Store history
+        history['train_loss'].append(train_loss)
+        history['train_f1'].append(train_f1)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_f1'].append(val_f1)
+        history['val_acc'].append(val_acc)
+        
+        # Print
+        print(f"Epoch {epoch+1:3d}/{config['n_epochs']} | "
+              f"TrLoss: {train_loss:.4f} TrF1: {train_f1:.4f} TrAcc: {train_acc:.4f} | "
+              f"VaLoss: {val_loss:.4f} VaF1: {val_f1:.4f} VaAcc: {val_acc:.4f}")
+        
+        # Save best
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_f1': val_f1
+            }, os.path.join(config['save_dir'], "best_model.pth"))
+            print(f"  ✓ New best model saved (F1: {val_f1:.4f})")
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= config['patience']:
+            print(f"\nEarly stopping at epoch {epoch+1}")
+            break
+        
+        scheduler.step()
+    
+    # Plot
+    plot_history(history, config['save_dir'])
 
-    # ---- Evaluate ----
-    print("Loading best model...")
-    checkpoint = torch.load(os.path.join(config['save_dir'], "best_model.pth"))
+    # Test evaluation
+    print("\n" + "="*70)
+    print("TEST SET EVALUATION")
+    print("="*70)
+    
+    checkpoint = torch.load(
+        os.path.join(config['save_dir'], "best_model.pth"),
+        map_location=config['device'],
+        weights_only=False
+    )
     model.load_state_dict(checkpoint['model_state_dict'])
-
-    evaluate_model(test_loader, model, config['device'], label_encoder)
-
-    print(f"Training complete. Best Val F1 = {history['best_val_f1']:.4f}")
+    
+    _, test_f1, test_acc, test_preds, test_labels = validate(
+        model, test_loader, criterion, config['device']
+    )
+    
+    print(f"\nTest F1:       {test_f1:.4f}")
+    print(f"Test Accuracy: {test_acc:.4f}\n")
+    
+    print("Classification Report:")
+    print(classification_report(test_labels, test_preds, 
+                                target_names=label_encoder.classes_, digits=4))
+    
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(test_labels, test_preds)
+    print(cm)
+    
+    print("\nPer-Class Metrics:")
+    for i, cls in enumerate(label_encoder.classes_):
+        cls_acc = cm[i, i] / cm[i].sum() if cm[i].sum() > 0 else 0
+        print(f"  {cls:25s} - Accuracy: {cls_acc:.4f} ({cm[i, i]}/{cm[i].sum()})")
+    
+    print("\n" + "="*70)
+    print(f"BEST VALIDATION F1: {best_val_f1:.4f}")
+    print(f"FINAL TEST F1:      {test_f1:.4f}")
+    print(f"Results saved to: {config['save_dir']}")
+    print("="*70)
 
 
 if __name__ == "__main__":
