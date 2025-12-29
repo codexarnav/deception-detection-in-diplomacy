@@ -262,15 +262,10 @@ class MultiClassDeceptionDetector(nn.Module):
 def load_and_preprocess_data(csv_path):
     df = pd.read_csv(csv_path)
     
-    df['sender_bool'] = df['sender_labels'].apply(parse_bool_label)
-    df['receiver_bool'] = df['receiver_labels'].apply(parse_bool_label)
-    
-    df['deception_state'] = df.apply(
-        lambda r: deception_state_from_bools(r['sender_bool'], r['receiver_bool']),
-        axis=1
-    )
-    
+    # processed_data.csv already has 'deception_state' column
+    # Just filter out any missing values
     df = df[df['deception_state'].notna()]
+    
     return df
 
 
@@ -627,7 +622,7 @@ def evaluate_model(test_loader, model, device, label_encoder):
 
 def main():
     config = {
-        'csv_path': 'data/final_dataset1.csv',
+        'csv_path': 'data/processed_data.csv',
         'model_path': 'test_allminilm_finetuned-20250829T234732Z-1-001/test_allminilm_finetuned',
         'strategic_dim': 256,
         'text_dim': 256,
