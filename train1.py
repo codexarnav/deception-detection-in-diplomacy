@@ -634,7 +634,7 @@ def main():
         'save_dir': f'./deception_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
         
         # Enhanced regularization params
-        'smote_k_neighbors': 7,
+        'smote_k_neighbors': 3,
         'label_smoothing': 0.1,
         'use_mixup': True,
         'mixup_alpha': 0.3,
@@ -674,39 +674,57 @@ def main():
     # ---- Labels ----
     labels, label_encoder = prepare_labels(df)
 
-    # -------------------------
-    #  SMOTE + TOMEK (IMPROVED)
-    # -------------------------
-
-    print("Fusing embeddings for SMOTE+Tomek...")
-    fused = np.concatenate([text_emb, strat_emb], axis=1)
-
-    print(f"Applying SMOTETomek (k_neighbors={config.get('smote_k_neighbors', 5)})...")
+    # ---- Train / Val / Test Split (BEFORE SMOTE to prevent leakage) ----
+    print("\n" + "="*70)
+    print("SPLITTING DATA (Before SMOTE to prevent leakage)")
+    print("="*70)
     print(f"Original class distribution: {np.bincount(labels)}")
     
-    # Using SMOTETomek: oversample minority AND remove Tomek links (noise)
+    # First split: separate test set (this will NOT be resampled)
+    X_text_trainval, X_text_test, X_strat_trainval, X_strat_test, y_trainval, y_test = train_test_split(
+        text_emb, strat_emb, labels, test_size=0.15, random_state=42, stratify=labels
+    )
+    
+    # Second split: separate validation set (this will NOT be resampled)
+    X_text_train, X_text_val, X_strat_train, X_strat_val, y_train, y_val = train_test_split(
+        X_text_trainval, X_strat_trainval, y_trainval, test_size=0.176, random_state=42, stratify=y_trainval
+    )  # 0.176 * 0.85 ≈ 0.15, so we get 70/15/15 split
+    
+    print(f"Train set: {len(y_train)} samples - {np.bincount(y_train)}")
+    print(f"Val set:   {len(y_val)} samples - {np.bincount(y_val)}")
+    print(f"Test set:  {len(y_test)} samples - {np.bincount(y_test)}")
+    print("="*70 + "\n")
+
+    # -------------------------
+    #  SMOTE + TOMEK (FIXED - Applied ONLY to training data)
+    # -------------------------
+    print("="*70)
+    print("APPLYING SMOTE+TOMEK (Only to training data)")
+    print("="*70)
+    
+    # Fuse training embeddings
+    fused_train = np.concatenate([X_text_train, X_strat_train], axis=1)
+    
+    print(f"Training class distribution before SMOTE: {np.bincount(y_train)}")
+    print(f"Applying SMOTETomek (k_neighbors={config.get('smote_k_neighbors', 5)})...")
+    
+    # Apply SMOTETomek ONLY to training data
     smt = SMOTETomek(
-        smote=SMOTE(k_neighbors=config.get('smote_k_neighbors', 5), random_state=42),
+        smote=SMOTE(k_neighbors=config.get('smote_k_neighbors', 5), random_state=42, sampling_strategy=1.0),
         random_state=42
     )
-    fused_resampled, labels_resampled = smt.fit_resample(fused, labels)
+    fused_train_resampled, y_train_resampled = smt.fit_resample(fused_train, y_train)
     
-    print(f"Resampled class distribution: {np.bincount(labels_resampled)}")
+    print(f"Training class distribution after SMOTE: {np.bincount(y_train_resampled)}")
+    print("="*70 + "\n")
 
-    # Un-fuse
-    text_dim = text_emb.shape[1]
-    X_text = fused_resampled[:, :text_dim]
-    X_strat = fused_resampled[:, text_dim:]
-    y = labels_resampled
-
-    # ---- Train / Val / Test Split ----
-    X_text_train, X_text_temp, X_strat_train, X_strat_temp, y_train, y_temp = train_test_split(
-        X_text, X_strat, y, test_size=0.3, random_state=42, stratify=y
-    )
-
-    X_text_val, X_text_test, X_strat_val, X_strat_test, y_val, y_test = train_test_split(
-        X_text_temp, X_strat_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
-    )
+    # Un-fuse the resampled training data
+    text_dim = X_text_train.shape[1]
+    X_text_train = fused_train_resampled[:, :text_dim]
+    X_strat_train = fused_train_resampled[:, text_dim:]
+    y_train = y_train_resampled
+    
+    # Validation and test sets remain unchanged (no SMOTE applied)
 
     # ---- Dataloaders ----
     train_dataset = DeceptionDataset(X_text_train, X_strat_train, y_train)

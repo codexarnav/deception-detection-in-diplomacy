@@ -126,8 +126,8 @@ def _initialize_models():
     _message_encoder = SentenceTransformer('all-MiniLM-L6-v2')
     _message_encoder.to(device)
     
-    # Initialize scaler with dummy data (25 features)
-    dummy_features = np.random.randn(10, 25)
+    # Initialize scaler with dummy data (20 features after removing deception patterns)
+    dummy_features = np.random.randn(10, 20)
     _scaler.fit(dummy_features)
     
     _is_initialized = True
@@ -203,27 +203,26 @@ def get_strategic_embeddings(sender: str, receiver: str, message: str,
                 0.0   # Send/receive ratio
             ])
         
-        # 3. Deception patterns (5 features) - same as original
-        # Default unknown deception state distribution
-        features.extend([0.0, 0.0, 0.0, 0.0, 1.0])  # [no_deception, successful_deception, unsuccessful_suspicion, successful_suspicion, unknown]
-        
-        # 4. Text features (8 features) - same as original
+        # 3. Text features (8 features) - from message content
         text_cols = ['word_count', 'sentence_count', 'exclamation_count', 
                    'strategic_score', 'deception_score', 'urgency_score', 
                    'cooperation_score', 'aggression_score']
         for col in text_cols:
             features.append(float(text_features.get(col, 0.0)))
         
-        # 5. Temporal features (3 features) - same as original
+        # 4. Temporal features (3 features) - message timing
         features.extend([
             float(game_context.get('absolute_message_index', 1)),
             float(game_context.get('relative_message_index', 1)),
             float(1)  # message_position default
         ])
         
-        # Ensure exactly 25 features
-        features = features[:25]
-        while len(features) < 25:
+        # Total: 5 (performance) + 4 (activity) + 8 (text) + 3 (temporal) = 20 features
+        # Removed deception pattern features to prevent potential target leakage
+        
+        # Ensure exactly 20 features
+        features = features[:20]
+        while len(features) < 20:
             features.append(0.0)
         
         node_features.append(features)
@@ -242,7 +241,7 @@ def get_strategic_embeddings(sender: str, receiver: str, message: str,
     global _gnn_model
     if _gnn_model is None:
         _gnn_model = StrategicGNN(
-            node_features=25,
+            node_features=20,  # Updated from 25 after removing deception pattern features
             message_dim=node_message_embeddings.shape[1],
             embedding_dim=256
         ).to(device)
