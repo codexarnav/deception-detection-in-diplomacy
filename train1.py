@@ -635,7 +635,7 @@ def main():
         
         # Enhanced regularization params
         'smote_k_neighbors': 3,
-        'label_smoothing': 0.1,
+        'label_smoothing': 0.05,
         'use_mixup': True,
         'mixup_alpha': 0.3,
         'dropout1': 0.22798466779344834,
@@ -653,8 +653,8 @@ def main():
         'attention_dropout': 0.1,  # Attention-specific dropout
         
         # Loss params
-        'focal_alpha': 0.78530692087020266,
-        'focal_gamma': 2.740172718188119,
+        'focal_alpha': 0.95,
+        'focal_gamma': 2.0,
         'weight_decay': 1.1615339145351501e-05
     }
     
@@ -709,9 +709,16 @@ def main():
     print(f"Applying SMOTETomek (k_neighbors={config.get('smote_k_neighbors', 5)})...")
     
     # Apply SMOTETomek ONLY to training data
+    '''
     smt = SMOTETomek(
         smote=SMOTE(k_neighbors=config.get('smote_k_neighbors', 5), random_state=42, sampling_strategy=1.0),
         random_state=42
+    )
+    '''
+    smt = SMOTE(
+        k_neighbors=3, 
+        random_state=42, 
+        sampling_strategy=1.0  # Full balance
     )
     fused_train_resampled, y_train_resampled = smt.fit_resample(fused_train, y_train)
     
